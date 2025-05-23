@@ -4,7 +4,7 @@ from pathlib import Path
 import nltk
 from nltk.stem import WordNetLemmatizer
 from pymorphy2 import MorphAnalyzer
-from Configs import CurrentApp
+from Configs import CurrentApp # Предполагается, что CurrentApp имеет app_id, language, mood
 
 class TextCleaner:
     def __init__(self, game: CurrentApp, min_words=4, use_lemmatization=True):
@@ -12,21 +12,42 @@ class TextCleaner:
         output_dir='data'
         self.app_id = game.app_id
         self.language = game.language
-        self.mood = game.mood
-        self.min_words = min_words  # Новый параметр
+        # self.mood теперь не используется для определения имени ВЫХОДНОГО файла,
+        # так как всегда будем пытаться обработать и positive, и negative.
+        # Однако, оно может быть использовано для фильтрации данных для LDA, если это потребуется позже.
+        self.mood = game.mood 
+        self.min_words = min_words
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.use_lemmatization = use_lemmatization
         self.lemmatizer = None
+        
+        # Проверка и загрузка необходимых ресурсов NLTK
+        try:
+            if self.language == 'russian':
+                pass # PyMorphy2 не требует загрузки ресурсов NLTK
+            elif self.language == 'english':
+                try:
+                    nltk.data.find('corpora/wordnet')
+                except LookupError:
+                    print("Downloading NLTK 'wordnet' corpus...")
+                    nltk.download('wordnet')
+                try:
+                    nltk.data.find('corpora/omw-1.4') # Open Multilingual Wordnet, often needed with wordnet
+                except LookupError:
+                    print("Downloading NLTK 'omw-1.4' corpus...")
+                    nltk.download('omw-1.4')
+            else:
+                print(f"Лемматизация не поддерживается для языка: {self.language}")
+        except Exception as e:
+            print(f"Ошибка при загрузке NLTK ресурсов: {e}")
+
         if self.use_lemmatization:
             if self.language == 'russian':
                 self.lemmatizer = MorphAnalyzer()
             elif self.language == 'english':
                 self.lemmatizer = WordNetLemmatizer()
-            else:
-                print(f"Лемматизация не поддерживается для языка: {self.language}")
-        self.input_file = self.input_dir / f"{game.app_id}_{game.language}_{game.mood}_reviews.csv"
-        self.output_file = self.output_dir / f"{game.app_id}_{game.language}_{game.mood}_cleaned_reviews.csv"
+            # Если язык не русский и не английский, lemmatizer останется None
 
     def _lemmatize_text(self, text):
         """Лемматизация текста с учетом языка"""
@@ -37,14 +58,15 @@ class TextCleaner:
         lemmatized = []
         
         for token in tokens:
-            # Для русского языка
             if self.language == 'russian':
+                # PyMorphy2: parse возвращает список морфологических анализов, берем первый (наиболее вероятный)
                 lemma = self.lemmatizer.parse(token)[0].normal_form
-            # Для английского языка
             elif self.language == 'english':
-                lemma = self.lemmatizer.lemmatize(token)
+                # WordNetLemmatizer: по умолчанию лемматизирует как существительное.
+                # Для лучшей лемматизации можно добавить POS-теггинг (например, 'n', 'v', 'a', 'r').
+                lemma = self.lemmatizer.lemmatize(token) 
             else:
-                lemma = token
+                lemma = token # Если язык не поддерживается, токен возвращается без изменений
                 
             lemmatized.append(lemma)
             
@@ -56,7 +78,6 @@ class TextCleaner:
         if not isinstance(text, str):
             return text
             
-        # Исправленное регулярное выражение
         pattern = r'\[/?[^\]]+\]'
         return re.sub(pattern, '', text, flags=re.IGNORECASE)
 
@@ -67,9 +88,9 @@ class TextCleaner:
             return text
             
         replacements = [
-            (r'\n+', '. '),    # Замена переносов строк
+            (r'\n+', '. '),    # Замена переносов строк на точку с пробелом
             (r'\t+', ' '),     # Удаление табов
-            (r'\.(?! )', '. '),# Добавление пробелов после точек
+            (r'\.(?! )', '. '),# Добавление пробелов после точек, если его нет
             (r'\s+\.', '.'),   # Удаление пробелов перед точками
             (r'\s+', ' '),     # Удаление множественных пробелов
             (r'\s*\.\s*', '. ')# Нормализация пробелов вокруг точек
@@ -95,29 +116,69 @@ class TextCleaner:
         
         for cleaner in cleaners:
             text = cleaner(text)
-            
+        
+        # Лемматизация применяется после основной очистки
+        text = self._lemmatize_text(text)
+        
         return text
 
     def process(self):
-        """Основной метод обработки файла"""
+        """
+        Основной метод обработки файла.
+        Теперь обрабатывает позитивные и негативные отзывы отдельно и сохраняет их в отдельные файлы.
+        """
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Загрузка данных
-        reviews = pd.read_csv(self.input_file)
-        
-        # Очистка текста
-        reviews['review'] = reviews['review'].apply(self._clean_text)
-        
-        # НОВЫЙ БЛОК: Фильтрация коротких комментариев
+        # Вспомогательная функция для подсчета слов
         def count_words(text):
             if not isinstance(text, str):
                 return 0
             return len([word for word in text.split() if word.strip()])
+
+        # --- Обработка позитивных отзывов ---
+        positive_input_path = self.input_dir / f"{self.app_id}_{self.language}_positive_reviews.csv"
+        positive_output_path = self.output_dir / f"{self.app_id}_{self.language}_positive_cleaned_reviews.csv"
+
+        if positive_input_path.exists():
+            print(f"Processing positive reviews from: {positive_input_path}")
+            positive_df = pd.read_csv(positive_input_path, dtype={'recommendationid': str})
             
-        reviews['word_count'] = reviews['review'].apply(count_words)
-        initial_count = len(reviews)
-        reviews = reviews[reviews['word_count'] >= self.min_words].drop(columns=['word_count'])
-        removed_count = initial_count - len(reviews)
-        
-        # Сохранение
-        reviews.to_csv(self.output_file, index=False, encoding='utf-8')
+            # Очистка текста
+            positive_df['review'] = positive_df['review'].apply(self._clean_text)
+            
+            # Фильтрация коротких комментариев
+            initial_count = len(positive_df)
+            positive_df['word_count'] = positive_df['review'].apply(count_words)
+            positive_df = positive_df[positive_df['word_count'] >= self.min_words].drop(columns=['word_count'])
+            removed_count = initial_count - len(positive_df)
+            print(f"Removed {removed_count} short positive reviews (less than {self.min_words} words).")
+            
+            # Сохранение очищенных позитивных отзывов
+            positive_df.to_csv(positive_output_path, index=False, encoding='utf-8')
+            print(f"Cleaned positive reviews saved to: {positive_output_path}")
+        else:
+            print(f"Warning: Positive reviews file not found at {positive_input_path}. Skipping positive review cleaning.")
+            
+        # --- Обработка негативных отзывов ---
+        negative_input_path = self.input_dir / f"{self.app_id}_{self.language}_negative_reviews.csv"
+        negative_output_path = self.output_dir / f"{self.app_id}_{self.language}_negative_cleaned_reviews.csv"
+
+        if negative_input_path.exists():
+            print(f"Processing negative reviews from: {negative_input_path}")
+            negative_df = pd.read_csv(negative_input_path, dtype={'recommendationid': str})
+
+            # Очистка текста
+            negative_df['review'] = negative_df['review'].apply(self._clean_text)
+            
+            # Фильтрация коротких комментариев
+            initial_count = len(negative_df)
+            negative_df['word_count'] = negative_df['review'].apply(count_words)
+            negative_df = negative_df[negative_df['word_count'] >= self.min_words].drop(columns=['word_count'])
+            removed_count = initial_count - len(negative_df)
+            print(f"Removed {removed_count} short negative reviews (less than {self.min_words} words).")
+            
+            # Сохранение очищенных негативных отзывов
+            negative_df.to_csv(negative_output_path, index=False, encoding='utf-8')
+            print(f"Cleaned negative reviews saved to: {negative_output_path}")
+        else:
+            print(f"Warning: Negative reviews file not found at {negative_input_path}. Skipping negative review cleaning.")

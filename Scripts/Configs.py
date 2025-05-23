@@ -1,4 +1,4 @@
-AI_TOKEN = "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"
+AI_TOKEN = "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"
 mood_list = ['positive', 'negative', 'all']
 language_list = ['russian', 'english']
 
